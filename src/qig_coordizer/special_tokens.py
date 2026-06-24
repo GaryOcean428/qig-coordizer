@@ -1,17 +1,16 @@
 """Reserved special-token scheme for qig-coordizer.
 
-The byte-level coordizer assigns coord ids ``0..255`` to raw bytes and ``256+``
-to learned geodesic-fusion merges (see :class:`coordizer.FisherCoordizer`).
-Special/control tokens therefore need ids that a byte can never produce.
+The byte-level coordizer assigns coord ids 0..255 to raw bytes and 256+ to learned
+geodesic-fusion merges (``FisherCoordizer`` starts merges at id 256). Special/control
+tokens therefore must NOT occupy the byte range OR the merge range — they are
+**appended ABOVE the trained vocabulary**, so they never collide and merges still start
+at 256 unchanged.
 
-HONEST SCOPE — NOT YET WIRED. These ids are *defined* here but the live
-``FisherCoordizer`` is still pure byte+merge and starts learned merges at id
-256. This module is the designated home for the PAD/BOS/EOS the Qwen language
-boundary will need (design Phase 3: output-distribution → Δ⁶³ → QIGRAM).
-Wiring is deferred to that phase precisely so Phase 0 keeps the
-``incremental==naive`` equivalence gate byte-for-byte intact. When wired, the
-first learned-merge id must shift past the reserved block (see
-:attr:`SpecialTokens.first_merge_id`).
+HONEST SCOPE — NOT YET WIRED. ``FisherCoordizer`` is still pure byte+merge; these ids
+are the designated home for the PAD/BOS/EOS the Qwen language boundary will need
+(design Phase 3). Wiring is deferred. This scheme is collision-free BY CONSTRUCTION —
+the prior draft placed ``pad`` at id 256, which COLLIDED with merge-id 256 (caught in
+the council red-team, fixed here).
 """
 
 from __future__ import annotations
@@ -23,28 +22,32 @@ BYTE_VOCAB_SIZE = 256
 
 @dataclass(frozen=True)
 class SpecialTokens:
-    """Proposed reserved coordizer ids for boundary/control tokens.
+    """Reserved control-token ids, appended ABOVE the trained vocab (collision-free).
 
-    Provisional layout — not consumed by ``FisherCoordizer`` yet.
+    Construct with the trained ``vocab_size`` as ``base``; ids become ``base, base+1, …``
+    — above every byte (0..255) and every learned merge (256..vocab_size-1). There is no
+    safe hardcoded base (it depends on how many merges were learned), so ``base`` is
+    required and validated.
     """
 
-    pad: int = 256
-    bos: int = 257
-    eos: int = 258
-    unk: int = 259
+    base: int
+    names: tuple[str, ...] = ("<pad>", "<bos>", "<eos>", "<unk>")
+
+    def __post_init__(self) -> None:
+        if self.base < BYTE_VOCAB_SIZE:
+            raise ValueError(
+                f"special-token base ({self.base}) must be ≥ {BYTE_VOCAB_SIZE} and at or "
+                "above the trained vocab size — special tokens append ABOVE the vocab, "
+                "never inside the byte/merge range"
+            )
+
+    @property
+    def ids(self) -> dict[str, int]:
+        return {name: self.base + i for i, name in enumerate(self.names)}
 
     @property
     def count(self) -> int:
-        return 4
-
-    @property
-    def first_merge_id(self) -> int:
-        """First id available for learned geodesic-fusion merges once special
-        tokens are wired (currently the live coordizer ignores this and starts
-        merges at ``BYTE_VOCAB_SIZE``)."""
-        return BYTE_VOCAB_SIZE + self.count
+        return len(self.names)
 
 
-DEFAULT_SPECIAL_TOKENS = SpecialTokens()
-
-__all__ = ["SpecialTokens", "DEFAULT_SPECIAL_TOKENS", "BYTE_VOCAB_SIZE"]
+__all__ = ["SpecialTokens", "BYTE_VOCAB_SIZE"]

@@ -18,7 +18,7 @@ from qig_coordizer.cache import IncrementalCouplingCache
 from qig_coordizer.constants import BASIN_DIM
 from qig_coordizer.coordizer import FisherCoordizer
 from qig_coordizer.normalizer import Normalizer
-from qig_coordizer.special_tokens import DEFAULT_SPECIAL_TOKENS, SpecialTokens
+from qig_coordizer.special_tokens import SpecialTokens
 from qig_coordizer.types import (
     BasinCoordinate,
     CoordizationResult,
@@ -39,7 +39,6 @@ __all__ = [
     "GranularityConfig",
     "VocabStats",
     "SpecialTokens",
-    "DEFAULT_SPECIAL_TOKENS",
     "BASIN_DIM",
     "__version__",
 ]
