@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.so
+
+# Envs
+.venv/
+venv/
+.env
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Local training cruft / large artifacts (kept locally, never committed)
+data/checkpoints/
+artifacts/
+*.npy
+*.json.gz
+checkpoint_*.json

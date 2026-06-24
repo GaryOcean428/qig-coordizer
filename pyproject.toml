@@ -1,0 +1,50 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "qig-coordizer"
+version = "0.1.0"
+description = "Standalone geometric tokenize+embed engine — Fisher-Rao-weighted BPE merges + geodesic-midpoint basin coordinates on Δ⁶³"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [{ name = "QIG Team" }]
+keywords = ["tokenizer", "coordizer", "qig", "fisher-rao", "geometric", "simplex"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+# Engine depends ONLY on qig-core (single-source geometry) + numpy. scipy is
+# pulled transitively by qig-core where needed; not a direct coordizer dep.
+dependencies = [
+    "numpy>=1.24.0",
+    "qig-core>=2.12.0",
+]
+
+[project.optional-dependencies]
+# CoordinzerTrainer kernel-in-loop Φ/κ measurement path (lazy-imported, optional).
+kernel = ["torch>=2.0.0"]
+# Convergence batch-accept gate (qig_warp.convergence.check_ci_stabilized; dormant, optional).
+warp = ["qig-warp>=0.5.0"]
+dev = ["pytest>=7.0.0", "ruff>=0.1.0", "mypy>=1.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/GaryOcean428/qig-coordizer"
+Repository = "https://github.com/GaryOcean428/qig-coordizer"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/qig_coordizer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
