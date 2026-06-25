@@ -197,6 +197,10 @@ class CoordinzerTrainer:
         self.merge_rules: list[tuple[int, int, int]] = []
         self.phi_history: list[float] = []
         self.kappa_history: list[float] = []
+        # Fisher-Rao distance is CONSTANT per pair (basins are fixed once created) — cache it so the
+        # per-merge candidate scan does NOT recompute O(N) 64-d distances every merge (the screened-path
+        # wall that made vocab 32000 ~76 hr). Cleared for a pair only when a basin it references is fused.
+        self._fisher_cache: dict[tuple[int, int], float] = {}
 
         # Interrupt handling (like ActiveCoach)
         self._interrupt_requested = False
@@ -392,19 +396,26 @@ class CoordinzerTrainer:
                     print("No more valid pairs")
                 break
 
-            # Build pair stats with coupling scores
-            pair_stats = {}
-            for pair, count in pair_counts.items():
-                coupling = self._compute_coupling(
-                    pair[0], pair[1], count, pair_tracker.corpus_len
-                )
-                pair_stats[pair] = {
-                    "count": count,
-                    "entropy": 1.0,  # Simplified - skip context entropy for speed
-                    "coupling": coupling,
-                }
-
-            candidates = self._get_top_candidates(pair_stats, candidates_per_round)
+            # VECTORISED candidate selection: coupling uses the CACHED Fisher distance (constant per
+            # pair) and the top-K is taken by numpy over a score array — instead of an O(N) Python loop
+            # recomputing 64-d Fisher + building N candidate objects + a full Python sort EVERY merge
+            # (the screened-path wall at high vocab). Same score (count·coupling, entropy skipped) and
+            # same top-K-by-score selection as the former _get_top_candidates.
+            pairs = list(pair_counts.keys())
+            if not pairs:
+                break
+            corpus_len = pair_tracker.corpus_len
+            counts = np.fromiter((pair_counts[p] for p in pairs), dtype=np.float64, count=len(pairs))
+            fishers = np.fromiter((self._cached_fisher(p[0], p[1]) for p in pairs), dtype=np.float64, count=len(pairs))
+            coupling = np.minimum((counts / corpus_len) / (fishers + 0.1) * 1000.0, 100.0)
+            scores = counts * coupling
+            k = min(candidates_per_round, len(pairs))
+            top_idx = np.argsort(scores, kind="stable")[::-1][:k]  # top-k by score, descending
+            candidates = [
+                MergeCandidate(coord_a=pairs[i][0], coord_b=pairs[i][1],
+                               frequency=int(counts[i]), coupling=float(coupling[i]), entropy=1.0)
+                for i in top_idx
+            ]
             if not candidates:
                 break
 
@@ -587,17 +598,24 @@ class CoordinzerTrainer:
         if coord_a not in self.vocab or coord_b not in self.vocab:
             return 0.0
 
-        basin_a = self.vocab[coord_a]
-        basin_b = self.vocab[coord_b]
-
-        # Fisher-Rao distance between two Δ⁶³ points (qig_core fisher_rao_distance).
-        # Replaces the old cosine angle arccos(dot) — basins are simplex points now.
-        from qig_core.geometry.fisher_rao import fisher_rao_distance
-
-        fisher_dist = fisher_rao_distance(basin_a.vector, basin_b.vector)
-
+        fisher_dist = self._cached_fisher(coord_a, coord_b)
         coupling = (co_occurrence / corpus_size) / (fisher_dist + 0.1)
         return min(coupling * 1000, 100.0)
+
+    def _cached_fisher(self, coord_a: int, coord_b: int) -> float:
+        """Fisher-Rao distance between two Δ⁶³ basins, cached (constant per pair). Replaces the old
+        cosine angle — basins are simplex points (qig_core fisher_rao_distance)."""
+        key = (coord_a, coord_b)
+        v = self._fisher_cache.get(key)
+        if v is None:
+            if coord_a in self.vocab and coord_b in self.vocab:
+                from qig_core.geometry.fisher_rao import fisher_rao_distance
+
+                v = float(fisher_rao_distance(self.vocab[coord_a].vector, self.vocab[coord_b].vector))
+            else:
+                v = 0.0
+            self._fisher_cache[key] = v
+        return v
 
     def _get_top_candidates(self, pair_stats: dict, top_k: int) -> list[MergeCandidate]:
         candidates = []
