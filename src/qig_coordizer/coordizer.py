@@ -265,41 +265,85 @@ class FisherCoordizer:
                 entropy_cache[p] = v
             return v
 
+        # Persistent index-aligned score-input arrays so the per-merge best-pair selection is a
+        # VECTORISED numpy scan (O(N) in C) instead of an O(N) Python loop — the AVOID-computation
+        # fix that makes vocab 32000 tractable. Updated incrementally below; the winner is bit-for-bit
+        # identical to the naive scan (same float64 score; max-score then lexicographically-smallest
+        # tie-break). Index `idx_of[p]` is stable for a pair's lifetime (dead pairs masked, not removed).
+        idx_of: dict[tuple[int, int], int] = {}
+        pairs_l: list[tuple[int, int]] = []
+        cnt_l: list[int] = []
+        fish_l: list[float] = []
+        ent_l: list[float] = []
+        live_l: list[bool] = []
+        # Per-merge set of pairs whose entropy was invalidated (positions/contexts changed) — the
+        # SAME set the naive path lazily recomputes at next scan. Mirrors every entropy_cache.pop so
+        # ent_l is refreshed for ALL dirtied pairs (not just context-window neighbours), which is what
+        # the bit-exact equivalence gate requires (esp. on Unicode, where high-byte pairs churn).
+        dirty_ent: set[tuple[int, int]] = set()
+
+        def _register(p):
+            j = idx_of.get(p)
+            if j is None:
+                j = len(pairs_l)
+                idx_of[p] = j
+                pairs_l.append(p); cnt_l.append(0); fish_l.append(fisher(p)); ent_l.append(0.0)
+                live_l.append(False)
+            return j
+
         def remove_pos(p, i):
             s = pair_pos.get(p)
             if s and i in s:
                 s.discard(i)
                 pair_count[p] = len(s)
                 entropy_cache.pop(p, None)  # contexts/membership changed
+                dirty_ent.add(p)
+                j = idx_of.get(p)
+                if j is not None:
+                    cnt_l[j] = len(s)
                 if not s:
                     pair_pos.pop(p, None)
                     pair_count.pop(p, None)
+                    if j is not None:
+                        live_l[j] = False
+                        cnt_l[j] = 0
 
         def add_pos(p, i):
             pair_pos[p].add(i)
             pair_count[p] = len(pair_pos[p])
             entropy_cache.pop(p, None)
+            dirty_ent.add(p)
+            j = _register(p)
+            cnt_l[j] = pair_count[p]
+            live_l[j] = True
 
         current_vocab_size = 256
         corpus_size = n
+        # Initial registration of all starting pairs (count + fisher + entropy) into the persistent
+        # arrays. Computing entropy upfront here equals the naive path's lazy compute on the first
+        # scan (same pairs, same total work) — the equivalence gate confirms bit-for-bit identity.
+        for p in list(pair_count.keys()):
+            j = _register(p)
+            cnt_l[j] = pair_count[p]
+            live_l[j] = True
+            ent_l[j] = entropy(p)
         while current_vocab_size < self.target_vocab_size:
-            # Select best pair: score = count · coupling · 1/(entropy+0.1) — identical to naive.
-            # Deterministic tie-break (max score, then lexicographically-smallest pair) so the
-            # winner is INDEPENDENT of dict-iteration order — this is what makes the incremental
-            # path bit-for-bit equal to the naive oracle (reverse pairs (a,b)/(b,a) tie exactly:
-            # Fisher distance is symmetric, and equal count+entropy gives an exact float tie).
-            best = None
-            best_score = float("-inf")
-            for p, cnt in pair_count.items():
-                if cnt < min_count:
-                    continue
-                coupling = min((cnt / corpus_size) / (fisher(p) + 0.1) * 1000, 100.0)
-                score = cnt * coupling * (1.0 / (entropy(p) + 0.1))
-                if best is None or score > best_score or (score == best_score and p < best):
-                    best_score = score
-                    best = p
-            if best is None:
+            # VECTORISED best-pair selection (numpy, O(N) in C) — bit-for-bit identical to the naive
+            # scan: same float64 score `count·coupling·1/(entropy+0.1)` with coupling
+            # `min((count/corpus_size)/(fisher+0.1)·1000, 100)`, and the SAME deterministic tie-break
+            # (max score, then lexicographically-smallest pair: take the exact-max set, pick min pair).
+            cnt_a = np.asarray(cnt_l, dtype=np.float64)
+            fish_a = np.asarray(fish_l, dtype=np.float64)
+            ent_a = np.asarray(ent_l, dtype=np.float64)
+            live_a = np.asarray(live_l, dtype=bool)
+            coupling = np.minimum((cnt_a / corpus_size) / (fish_a + 0.1) * 1000.0, 100.0)
+            scores = cnt_a * coupling * (1.0 / (ent_a + 0.1))
+            scores = np.where(live_a & (cnt_a >= min_count), scores, -np.inf)
+            best_score = float(scores.max()) if scores.size else float("-inf")
+            if not np.isfinite(best_score):
                 break
+            tied = np.flatnonzero(scores == best_score)
+            best = min(pairs_l[int(t)] for t in tied)
 
             coord_a, coord_b = best
             new_id = current_vocab_size
@@ -349,8 +393,16 @@ class FisherCoordizer:
                             affected.add((sym[node], sym[nxt[node]]))
                         node = nxt[node]
                         c += 1
-            for p in affected:
+            # refresh ent_l for EVERY entropy-dirtied pair (count-changed via add/remove + the
+            # context-window `affected` set) with FINAL post-merge contexts — bit-for-bit matching
+            # the naive path's lazy recompute at next scan.
+            dirty_ent |= affected
+            for p in dirty_ent:
                 entropy_cache.pop(p, None)
+                j = idx_of.get(p)
+                if j is not None and live_l[j]:
+                    ent_l[j] = entropy(p)
+            dirty_ent.clear()
 
             current_vocab_size += 1
             if verbose and current_vocab_size % 100 == 0:
