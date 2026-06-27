@@ -25,3 +25,4 @@ artifacts/
 *.npy
 *.json.gz
 checkpoint_*.json
+checkpoints/
