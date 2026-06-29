@@ -31,7 +31,7 @@ from qig_core import (  # single-source: qig-core owns BASIN_DIM
     BASIN_DIM,
 )
 from .types import BasinCoordinate
-from .cache import IncrementalCouplingCache
+from .cache import IncrementalCouplingCache, LazyPairHeap
 from .normalizer import Normalizer
 
 # Try to import kernel
@@ -355,6 +355,40 @@ class CoordinzerTrainer:
             print(f"  Found {len(pair_tracker.pair_counts):,} unique pairs")
             print()
 
+        # LAZY MAX-HEAP selection (amortised O(Δ·log P) per merge) replacing the per-merge full
+        # rebuild + np.argsort over ALL active pairs (O(P log P), the wall that made vocab 32000
+        # climb to a ~13-day ETA). Selection keeps the SAME deterministic total order as the former
+        # vectorised scan: max of count·coupling (coupling = min((count/L)/(d_FR+0.1)·1000, 100)),
+        # then lexicographically-smallest pair.
+        #
+        # HEAP KEY is the L-MULTIPLIED score  S' = count·min(r, 100·L)  with  r = count/(d_FR+0.1)·1000
+        # (the live corpus length L is a single global factor, so multiplying every pair's score by L
+        # leaves the argmax and all ties UNCHANGED). The point of the ×L form: ``r`` is L-independent
+        # (changes only with count), so an UNCLAMPED pair's key is constant until its count changes —
+        # exactly the regime the lazy "push only count-changed pairs" update assumes. Only CLAMPED
+        # pairs (r > 100L: the tiny minority of highest-count/closest pairs) carry an L-dependent key,
+        # and their key only SHRINKS as L shrinks, so a stale clamped entry is over-prioritised and is
+        # re-stamped down to truth when it surfaces — never buried. (Storing the raw 1/L score instead
+        # would make every unclamped pair L-dependent and silently bury the true max — the merge-10
+        # divergence this ×L form fixes.) d_FR is the cached, constant-per-pair Fisher-Rao distance.
+        def _pair_score(pair: tuple[int, int], count: int) -> float:
+            corpus_len = pair_tracker.corpus_len
+            fisher = self._cached_fisher(pair[0], pair[1])
+            r = count / (fisher + 0.1) * 1000.0
+            return count * min(r, 100.0 * corpus_len)
+
+        def _candidate(pair: tuple[int, int]) -> MergeCandidate:
+            count = pair_tracker.pair_counts[pair]
+            corpus_len = pair_tracker.corpus_len
+            fisher = self._cached_fisher(pair[0], pair[1])
+            coupling = min((count / corpus_len) / (fisher + 0.1) * 1000.0, 100.0)
+            return MergeCandidate(
+                coord_a=pair[0], coord_b=pair[1],
+                frequency=count, coupling=coupling, entropy=1.0,
+            )
+
+        pair_heap = LazyPairHeap(_pair_score, pair_tracker.pair_counts, min_frequency)
+
         # --- Convergence batch-accept gate (qig-warp check_ci_stabilized) ----------
         # The kernel forward (~3s/merge) dominates wall time. The per-merge coupling
         # (printed as "κ") decays as heavy pairs are consumed and stabilises low once
@@ -388,44 +422,34 @@ class CoordinzerTrainer:
                 interrupted = True
                 break
 
-            # Get pairs from incremental tracker (no rescan!)
-            pair_counts = pair_tracker.get_pairs(min_frequency)
-
-            if not pair_counts:
-                if verbose:
-                    print("No more valid pairs")
-                break
-
-            # VECTORISED candidate selection: coupling uses the CACHED Fisher distance (constant per
-            # pair) and the top-K is taken by numpy over a score array — instead of an O(N) Python loop
-            # recomputing 64-d Fisher + building N candidate objects + a full Python sort EVERY merge
-            # (the screened-path wall at high vocab). Same score (count·coupling, entropy skipped) and
-            # same top-K-by-score selection as the former _get_top_candidates.
-            pairs = list(pair_counts.keys())
-            if not pairs:
-                break
-            corpus_len = pair_tracker.corpus_len
-            counts = np.fromiter((pair_counts[p] for p in pairs), dtype=np.float64, count=len(pairs))
-            fishers = np.fromiter((self._cached_fisher(p[0], p[1]) for p in pairs), dtype=np.float64, count=len(pairs))
-            coupling = np.minimum((counts / corpus_len) / (fishers + 0.1) * 1000.0, 100.0)
-            scores = counts * coupling
-            k = min(candidates_per_round, len(pairs))
-            top_idx = np.argsort(scores, kind="stable")[::-1][:k]  # top-k by score, descending
-            candidates = [
-                MergeCandidate(coord_a=pairs[i][0], coord_b=pairs[i][1],
-                               frequency=int(counts[i]), coupling=float(coupling[i]), entropy=1.0)
-                for i in top_idx
-            ]
-            if not candidates:
-                break
-
             # Skip the kernel while inside the batch-accept window (re-engaged below).
             run_kernel = use_kernel and not batch_accept_mode
 
-            best_candidate = self._evaluate_with_kernel(
-                candidates, pair_tracker.sample(sample_size), sample_size,
-                fast_mode=not run_kernel,
-            )
+            if run_kernel:
+                # Kernel path: re-rank a small top-K slate by Φ. The heap yields the K highest-
+                # score pairs in canonical order (amortised O((K+stale)·log P)) — the same slate
+                # the old full argsort produced (top-K by score), just without the O(P log P) scan.
+                top_pairs = pair_heap.select_top_k(min(candidates_per_round, len(pair_tracker.pair_counts)))
+                if not top_pairs:
+                    if verbose:
+                        print("No more valid pairs")
+                    break
+                candidates = [_candidate(p) for p in top_pairs]
+                best_candidate = self._evaluate_with_kernel(
+                    candidates, pair_tracker.sample(sample_size), sample_size,
+                    fast_mode=False,
+                )
+            else:
+                # Fast / batch-accept path: the winner is the exact argmax of count·coupling with the
+                # canonical (max score, then lexicographically-smallest pair) tie-break — which the
+                # heap's resolved top gives directly, no candidate slate, no per-merge full scan.
+                best_pair = pair_heap.pop_best()
+                if best_pair is None:
+                    if verbose:
+                        print("No more valid pairs")
+                    break
+                best_candidate = _candidate(best_pair)
+
             if best_candidate is None:
                 break
             last_merge_batched = not run_kernel
@@ -445,6 +469,9 @@ class CoordinzerTrainer:
                 best_candidate.coord_b,
                 new_coord_id,
             )
+            # Re-stamp ONLY the pairs whose count this merge changed (the cache's Δ-set) onto the
+            # heap — the amortised O(Δ·log P) update that keeps selection off the O(P) rebuild.
+            pair_heap.push_changed(pair_tracker.last_changed)
 
             current_vocab_size += 1
             self.phi_history.append(best_candidate.phi_gain)

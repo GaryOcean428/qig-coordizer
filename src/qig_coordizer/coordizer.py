@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -68,6 +69,11 @@ class FisherCoordizer:
         self.vocab: dict[int, BasinCoordinate] = {}
         self.name_to_id: dict[str, int] = {}
 
+        # ATOMIC special/control tokens (SpecialTokens scheme): reserved ids ABOVE the trained vocab, never
+        # byte/merge-fragmented. coordize() splits these strings out atomically; decoordize() restores them.
+        self.special_tokens: dict[str, int] = {}     # surface string -> reserved id
+        self._special_re: re.Pattern[str] | None = None
+
         # Base byte coordinates (256 entries)
         self.byte_to_coord: dict[int, int] = {}
 
@@ -111,6 +117,36 @@ class FisherCoordizer:
             )
             self.vocab[byte_val] = coord
             self.byte_to_coord[byte_val] = byte_val
+
+    def register_special_tokens(self, names: list[str]) -> dict[str, int]:
+        """Reserve ATOMIC ids for control tokens ABOVE the trained vocab (SpecialTokens scheme — finally
+        wired). Each gets a distinct deterministic Δ⁶³ basin so ``vocab[id]`` exists for decode + the kernel
+        lm_head, and coordize() splits these surface strings out as single ids (never byte-fragmented — the
+        one hard geometric requirement for the studio's geometry-native template tags). Idempotent; returns
+        the {name: id} map. Call AFTER training (base = current vocab size, above every byte + merge)."""
+        base = max((max(self.vocab) + 1) if self.vocab else 256, 256)
+        for i, name in enumerate(names):
+            if name in self.special_tokens:
+                continue
+            tid = base + i
+            while tid in self.vocab:                         # collision-safe if specials pre-existed
+                tid += 1
+            self.special_tokens[name] = tid
+            np.random.seed(tid + 7919)                       # distinct, deterministic Δ⁶³ basin per token
+            self.vocab[tid] = BasinCoordinate(
+                coord_id=tid, vector=random_basin(self.basin_dim), name=name, scale="special")
+            self.name_to_id[name] = tid
+        self._rebuild_special_re()
+        return dict(self.special_tokens)
+
+    def _rebuild_special_re(self) -> None:
+        """Compile the splitter that carves special-token surfaces out of text BEFORE byte encoding
+        (longest-first so e.g. <|settle|> can never be partially matched)."""
+        if not self.special_tokens:
+            self._special_re = None
+            return
+        ordered = sorted(self.special_tokens, key=len, reverse=True)
+        self._special_re = re.compile("(" + "|".join(re.escape(s) for s in ordered) + ")")
 
     def train(
         self,
@@ -728,6 +764,13 @@ class FisherCoordizer:
         for coord_a, coord_b, new_coord in self.merge_rules:
             self._encoding_cache[(coord_a, coord_b)] = new_coord
 
+    def _coordize_plain(self, text: str) -> list[int]:
+        """Byte-encode + apply all fusion merges (the original coordize path, no special-token handling)."""
+        coord_ids = list(self._normalizer.to_bytes(text))
+        for coord_a, coord_b, new_coord in self.merge_rules:
+            coord_ids = self._apply_fusion(coord_ids, coord_a, coord_b, new_coord)
+        return coord_ids
+
     def coordize(self, text: str) -> CoordizationResult:
         """
         Convert text to sequence of basin coordinates.
@@ -738,15 +781,21 @@ class FisherCoordizer:
         Returns:
             CoordizationResult with coordinates and metadata
         """
-        # Encode to bytes via the NFC front-end (canonical text->bytes; matches a normalized vocab)
-        text_bytes = self._normalizer.to_bytes(text)
-
-        # Start with byte-level coordinates
-        coord_ids = list(text_bytes)
-
-        # Apply all fusion rules
-        for coord_a, coord_b, new_coord in self.merge_rules:
-            coord_ids = self._apply_fusion(coord_ids, coord_a, coord_b, new_coord)
+        # ATOMIC special tokens: carve their surfaces out FIRST → reserved ids; byte-encode the rest. A
+        # special-token string therefore becomes exactly one coord id (a single clean basin), never
+        # byte/merge-fragmented. (No registered specials → plain byte+merge path, unchanged.)
+        if self._special_re is not None:
+            coord_ids = []
+            for seg in self._special_re.split(text):
+                if not seg:
+                    continue
+                sid = self.special_tokens.get(seg)
+                if sid is not None:
+                    coord_ids.append(sid)
+                else:
+                    coord_ids.extend(self._coordize_plain(seg))
+        else:
+            coord_ids = self._coordize_plain(text)
 
         # Build coordinate list
         coordinates = [self.vocab[cid] for cid in coord_ids]
@@ -772,14 +821,32 @@ class FisherCoordizer:
         Returns:
             Reconstructed text string
         """
-        # Expand coordinates back to bytes
-        bytes_list = self._expand_to_bytes(coord_ids)
+        # Special-token ids restore to their surface string; byte/merge ids expand to bytes. Split the id
+        # stream into runs so a special id never gets mis-expanded as a byte.
+        inv = {tid: name for name, tid in self.special_tokens.items()}
 
-        # Decode bytes to string
-        try:
-            return bytes(bytes_list).decode("utf-8")
-        except UnicodeDecodeError:
-            return bytes(bytes_list).decode("utf-8", errors="replace")
+        def _bytes_to_str(ids: list[int]) -> str:
+            bl = self._expand_to_bytes(ids)
+            try:
+                return bytes(bl).decode("utf-8")
+            except UnicodeDecodeError:
+                return bytes(bl).decode("utf-8", errors="replace")
+
+        if not inv:
+            return _bytes_to_str(coord_ids)
+        out: list[str] = []
+        buf: list[int] = []
+        for cid in coord_ids:
+            if cid in inv:
+                if buf:
+                    out.append(_bytes_to_str(buf))
+                    buf = []
+                out.append(inv[cid])
+            else:
+                buf.append(cid)
+        if buf:
+            out.append(_bytes_to_str(buf))
+        return "".join(out)
 
     # Standard tokenizer interface aliases
     def encode(self, text: str) -> list[int]:
@@ -850,6 +917,7 @@ class FisherCoordizer:
             "basin_dim": self.basin_dim,
             "target_vocab_size": self.target_vocab_size,
             "merge_rules": self.merge_rules,
+            "special_tokens": self.special_tokens,   # atomic control-token ids (above the trained vocab)
             "vocab": {
                 str(k): {
                     "coord_id": v.coord_id,
@@ -913,6 +981,10 @@ class FisherCoordizer:
             instance.vocab[int(k)] = coord
             if v["name"]:
                 instance.name_to_id[v["name"]] = int(k)
+
+        # restore atomic special tokens (basins already loaded above with scale="special") + the splitter
+        instance.special_tokens = {n: int(i) for n, i in (data.get("special_tokens") or {}).items()}
+        instance._rebuild_special_re()
 
         instance._rebuild_encoding_cache()
         return instance
