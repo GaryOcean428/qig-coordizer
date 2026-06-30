@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "qig-coordizer"
-version = "0.1.1"
+version = "0.1.2"
 description = "Standalone geometric tokenize+embed engine — Fisher-Rao-weighted BPE merges + geodesic-midpoint basin coordinates on Δ⁶³"
 readme = "README.md"
 license = "MIT"

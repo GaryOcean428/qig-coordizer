@@ -300,6 +300,15 @@ class CoordinzerTrainer:
         is_resume = _resume_corpus is not None
         interrupted = False
 
+        # Compute corpus hash for provenance (SHA-256 of first/last 1MB — fast, no full hash)
+        import hashlib as _hl
+        if len(corpus) <= 2_000_000:
+            self._corpus_hash = _hl.sha256(corpus).hexdigest()[:16]
+        else:
+            head = corpus[:1_000_000]
+            tail = corpus[-1_000_000:]
+            self._corpus_hash = _hl.sha256(head + tail).hexdigest()[:16]
+
         # Start interrupt listener. Route Ctrl+C (SIGINT) into the SAME graceful
         # flag the ENTER listener sets, so an interrupt pauses + saves a checkpoint
         # cleanly instead of dumping a KeyboardInterrupt traceback mid-merge.
@@ -789,8 +798,18 @@ class CoordinzerTrainer:
     def _save_checkpoint(
         self, checkpoint_dir: str, vocab_size: int, keep_recent: int = 3
     ) -> None:
+        import subprocess
+        from datetime import datetime, timezone
+
         path = Path(checkpoint_dir)
         path.mkdir(parents=True, exist_ok=True)
+
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+            ).decode().strip()
+        except Exception:
+            git_commit = None
 
         data = {
             "vocab_size": vocab_size,
@@ -807,6 +826,17 @@ class CoordinzerTrainer:
                 for k, v in self.vocab.items()
             },
             "phi_history": self.phi_history,
+            "metadata": {
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "target_vocab_size": self.target_vocab_size,
+                "actual_vocab_size": len(self.vocab),
+                "basin_dim": self.basin_dim,
+                "merge_rules_count": len(self.merge_rules),
+                "phi_history_len": len(self.phi_history),
+                "corpus_hash": getattr(self, "_corpus_hash", None),
+                "git_commit": git_commit,
+                "trainer_version": "qig-coordizer 0.1.2",
+            },
         }
 
         with open(path / f"checkpoint_{vocab_size}.json", "w") as f:
@@ -858,6 +888,16 @@ class CoordinzerTrainer:
 
     def save(self, path: str) -> None:
         """Save coordizer to file."""
+        import subprocess
+        from datetime import datetime, timezone
+
+        try:
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "--short", "HEAD"], stderr=subprocess.DEVNULL
+            ).decode().strip()
+        except Exception:
+            git_commit = None
+
         data = {
             "target_vocab_size": self.target_vocab_size,
             "basin_dim": self.basin_dim,
@@ -874,6 +914,17 @@ class CoordinzerTrainer:
                 if k >= 256
             },
             "phi_history": self.phi_history,
+            "metadata": {
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "target_vocab_size": self.target_vocab_size,
+                "actual_vocab_size": len(self.vocab),
+                "basin_dim": self.basin_dim,
+                "merge_rules_count": len(self.merge_rules),
+                "phi_history_len": len(self.phi_history),
+                "corpus_hash": getattr(self, "_corpus_hash", None),
+                "git_commit": git_commit,
+                "trainer_version": "qig-coordizer 0.1.2",
+            },
         }
 
         with open(path, "w", encoding="utf-8") as f:
@@ -907,6 +958,10 @@ class CoordinzerTrainer:
                     name=v["name"],
                     scale=v["scale"],
                 )
+
+        # Restore provenance metadata from the saved block
+        meta = data.get("metadata", {})
+        trainer._corpus_hash = meta.get("corpus_hash")
 
         # Replay merge rules if vocab incomplete
         if len(trainer.vocab) <= 256 and trainer.merge_rules:
