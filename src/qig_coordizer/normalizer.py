@@ -51,13 +51,30 @@ class Normalizer:
         If ``True``, :meth:`to_byte_segments` splits text on word/whitespace/punctuation
         boundaries so the trainer can confine merges within a segment. Default ``False``
         (Phase-1 fix is NFC; the boundary is the optional refinement).
+    max_segment_bytes:
+        Optional CHAR-SAFE cap on a pre-token segment's UTF-8 byte-length. When set,
+        :meth:`to_byte_segments` splits any segment longer than the cap into consecutive
+        chunks each ``<= max_segment_bytes`` — but ONLY at UTF-8 character boundaries
+        (never mid-codepoint), so no chunk is the U+FFFD garbage a mid-character split
+        produces. This stops BPE wasting vocab slots on degenerate mega-merges over
+        pathological run-on segments (a 1873-byte word concatenation, 77-324-byte
+        ``|----`` markdown table-separator runs the ``\\w+``/``[^\\w\\s]+`` regex grabs
+        whole). Default ``None`` ⇒ NO splitting ⇒ output is byte-identical to no cap.
+        A single character whose own UTF-8 bytes exceed the cap still gets its own chunk
+        (char-boundary safety wins over the soft cap — concatenation is always lossless).
     """
 
-    def __init__(self, form: str = "NFC", pretokenize: bool = False) -> None:
+    def __init__(
+        self,
+        form: str = "NFC",
+        pretokenize: bool = False,
+        max_segment_bytes: int | None = None,
+    ) -> None:
         if form not in _VALID_FORMS:
             raise ValueError(f"form must be one of {_VALID_FORMS}, got {form!r}")
         self.form = form
         self.pretokenize = pretokenize
+        self.max_segment_bytes = max_segment_bytes
 
     # -- text -> text ---------------------------------------------------------------
     def normalize_text(self, text: str) -> str:
@@ -95,9 +112,44 @@ class Normalizer:
         segments = _PRETOKEN_RE.findall(norm)
         return segments
 
+    def _cap_char_safe(self, seg: str) -> list[list[int]]:
+        """Split a normalized string segment into consecutive byte-id chunks each of UTF-8
+        byte-length ``<= max_segment_bytes``, cutting ONLY at UTF-8 character boundaries.
+
+        Walk the segment's characters, accumulating into the current chunk until adding the
+        next character's UTF-8 bytes would exceed the cap, then start a new chunk. A character
+        never straddles a chunk boundary, so every chunk decodes cleanly (no U+FFFD garbage);
+        a single character whose own bytes exceed the cap still goes in its own chunk. The
+        concatenation of all chunk-bytes reconstructs ``seg.encode('utf-8')`` exactly (lossless).
+        With no cap set — or a segment already within the cap — returns the single whole segment.
+        """
+        data = seg.encode("utf-8")
+        cap = self.max_segment_bytes
+        if cap is None or len(data) <= cap:
+            return [list(data)]
+        chunks: list[list[int]] = []
+        cur: list[int] = []
+        for ch in seg:
+            cb = ch.encode("utf-8")
+            if cur and len(cur) + len(cb) > cap:  # would overflow -> boundary before this char
+                chunks.append(cur)
+                cur = []
+            cur.extend(cb)
+        if cur:
+            chunks.append(cur)
+        return chunks
+
     def to_byte_segments(self, text: str) -> list[list[int]]:
         """Pre-token boundary as a list of byte-id segments. A merge engine that never fuses
-        ACROSS segments cannot create a merge that splits a character or crosses a word end."""
-        if not self.pretokenize:
-            return [list(self.to_bytes(text))]
-        return [list(seg.encode("utf-8")) for seg in self.pretokenize_text(text)]
+        ACROSS segments cannot create a merge that splits a character or crosses a word end.
+
+        When ``max_segment_bytes`` is set, each segment is additionally chunked char-safely so
+        no single segment exceeds the cap — the single capped path BOTH training and inference
+        use, applied whether or not ``pretokenize`` is on (a huge no-whitespace blob is still
+        chunked). ``max_segment_bytes=None`` leaves output byte-identical to no cap.
+        """
+        segments = self.pretokenize_text(text) if self.pretokenize else [self.normalize_text(text)]
+        out: list[list[int]] = []
+        for seg in segments:
+            out.extend(self._cap_char_safe(seg))
+        return out

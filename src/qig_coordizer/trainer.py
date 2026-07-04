@@ -189,6 +189,7 @@ class CoordinzerTrainer:
         basin_dim: int = BASIN_DIM,
         device: str = "cpu",
         pretokenize: bool = False,
+        max_segment_bytes: int | None = None,
     ):
         self.target_vocab_size = target_vocab_size
         self.basin_dim = basin_dim
@@ -210,7 +211,8 @@ class CoordinzerTrainer:
         # NFC byte-level front-end — train corpus and coordize() must share it so the vocab and
         # the encoder agree byte-for-byte (NFC is a no-op for ASCII). Matches FisherCoordizer/Coordizer.
         # pretokenize=True confines merges to per-token segments (both here and at coordize()).
-        self._normalizer = Normalizer(pretokenize=pretokenize)
+        # max_segment_bytes caps degenerate run-on segments char-safely (both here and at coordize()).
+        self._normalizer = Normalizer(pretokenize=pretokenize, max_segment_bytes=max_segment_bytes)
 
         self._init_byte_coordinates()
 
@@ -957,6 +959,9 @@ class CoordinzerTrainer:
             # persist the pretokenize mode so FisherCoordizer.load restores the SAME segmentation the
             # vocab was trained with (else the trainer->load->save build chain silently drops it to False).
             "pretokenize": self._normalizer.pretokenize,
+            # persist the char-safe segment cap for the same reason — the encoder must chunk exactly
+            # as training did, so the trainer->load build chain carries it (None when no cap was set).
+            "max_segment_bytes": self._normalizer.max_segment_bytes,
             "merge_rules": self.merge_rules,
             "vocab": {
                 str(k): {

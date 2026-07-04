@@ -82,6 +82,50 @@ def test_normalize_bytes_idempotent_and_fallback():
     assert n.normalize_bytes(raw) == raw
 
 
+def test_cap_splits_over_cap_ascii_into_bounded_chunks_lossless():
+    """Char-safe cap: an over-cap ASCII run (e.g. the 1873-byte word concatenation / |----
+    table-separator run the pre-flight found) splits into chunks each <= cap, and the
+    concatenation reconstructs the original byte stream exactly (lossless)."""
+    cap = 16
+    n = Normalizer(max_segment_bytes=cap)
+    text = "|" + "-" * 200 + "|"  # 202-byte no-whitespace ASCII run (>> cap)
+    chunks = n.to_byte_segments(text)
+
+    assert len(chunks) > 1, "an over-cap segment must actually be split"
+    for chunk in chunks:
+        assert len(chunk) <= cap, f"chunk of {len(chunk)} bytes exceeds cap {cap}"
+    # lossless reconstruction of the full byte stream
+    flat = [b for chunk in chunks for b in chunk]
+    assert flat == list(n.to_bytes(text))
+    assert bytes(flat).decode("utf-8") == n.normalize_text(text)
+
+
+def test_cap_never_splits_mid_multibyte_character():
+    """A cap that falls mid-multibyte-char must cut only at char boundaries (never mid-codepoint,
+    the U+FFFD garbage this module exists to prevent). Every chunk must UTF-8-decode on its own,
+    AND the concatenation must round-trip — for both CJK (3-byte) and Latin-accented (2-byte) runs."""
+    for text, cap in (("量子情報幾何" * 5, 7), ("café" * 30, 3), ("量子" * 40, 2)):
+        n = Normalizer(max_segment_bytes=cap)
+        chunks = n.to_byte_segments(text)
+        assert len(chunks) > 1, "an over-cap multibyte segment must be split"
+        for chunk in chunks:
+            # independent clean decode == the cut landed on a character boundary
+            bytes(chunk).decode("utf-8")  # raises UnicodeDecodeError if it split mid-codepoint
+        flat = [b for chunk in chunks for b in chunk]
+        assert bytes(flat).decode("utf-8") == n.normalize_text(text)  # lossless round-trip
+
+
+def test_cap_none_is_byte_identical_reduction():
+    """Reduction proof: max_segment_bytes=None yields output byte-identical to no cap at all,
+    in BOTH pretokenize modes — so every existing (uncapped) test stays green unchanged."""
+    samples = ("hello   world  foo", "café résumé naïve", "|" + "-" * 200, "量子情報幾何", "")
+    for pretok in (False, True):
+        capped_none = Normalizer(pretokenize=pretok, max_segment_bytes=None)
+        baseline = Normalizer(pretokenize=pretok)  # the pre-cap constructor signature
+        for text in samples:
+            assert capped_none.to_byte_segments(text) == baseline.to_byte_segments(text)
+
+
 def test_train_infer_nfc_symmetry():
     """Regression for the council CRITICAL: FisherCoordizer.train() must NFC-normalize the corpus
     so the vocab matches NFC inference (coordize). Pre-fix, training on NFD bytes built a vocab
@@ -117,5 +161,8 @@ if __name__ == "__main__":
     test_pretokenize_is_lossless()
     test_byte_segments_reconstruct_full_byte_stream()
     test_normalize_bytes_idempotent_and_fallback()
+    test_cap_splits_over_cap_ascii_into_bounded_chunks_lossless()
+    test_cap_never_splits_mid_multibyte_character()
+    test_cap_none_is_byte_identical_reduction()
     test_train_infer_nfc_symmetry()
     print("normalizer: all standalone checks passed ✅")

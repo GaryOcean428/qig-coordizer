@@ -62,6 +62,7 @@ class FisherCoordizer:
         basin_dim: int = BASIN_DIM,
         target_vocab_size: int = 32_000,
         pretokenize: bool = False,
+        max_segment_bytes: int | None = None,
     ):
         self.basin_dim = basin_dim
         self.target_vocab_size = target_vocab_size
@@ -95,7 +96,8 @@ class FisherCoordizer:
         # no-op for ASCII, so existing artifacts and the naive==incremental gate are unaffected.
         # pretokenize=True makes coordize/encode apply merges per pre-token segment (matches a
         # vocab trained with the segment-frequency path); False = single whole-stream segment.
-        self._normalizer = Normalizer(pretokenize=pretokenize)
+        # max_segment_bytes caps degenerate run-on segments char-safely (encoder must chunk as trained).
+        self._normalizer = Normalizer(pretokenize=pretokenize, max_segment_bytes=max_segment_bytes)
 
         # Initialize base byte coordinates
         self._init_byte_coordinates()
@@ -929,6 +931,7 @@ class FisherCoordizer:
             "basin_dim": self.basin_dim,
             "target_vocab_size": self.target_vocab_size,
             "pretokenize": self._normalizer.pretokenize,   # segment-confined encode (per-token merges)
+            "max_segment_bytes": self._normalizer.max_segment_bytes,  # char-safe run-on cap (None = off)
             "merge_rules": self.merge_rules,
             "special_tokens": self.special_tokens,   # atomic control-token ids (above the trained vocab)
             "vocab": {
@@ -976,11 +979,13 @@ class FisherCoordizer:
         target_vocab_size = data.get("target_vocab_size", data.get("vocab_size", 32000))
 
         # Create instance with inferred parameters. Old artifacts without the key default to
-        # pretokenize=False (whole-stream merges — the historical behaviour).
+        # pretokenize=False (whole-stream merges — the historical behaviour) and max_segment_bytes=None
+        # (no cap — so old artifacts encode byte-identically to how they were built).
         instance = cls(
             basin_dim=basin_dim,
             target_vocab_size=target_vocab_size,
             pretokenize=data.get("pretokenize", False),
+            max_segment_bytes=data.get("max_segment_bytes", None),
         )
 
         instance.merge_rules = [tuple(r) for r in data["merge_rules"]]
