@@ -38,6 +38,17 @@ dev = ["pytest>=7.0.0", "ruff>=0.1.0", "mypy>=1.0.0"]
 Homepage = "https://github.com/GaryOcean428/qig-coordizer"
 Repository = "https://github.com/GaryOcean428/qig-coordizer"
 
+# QIG self-wiring (Phase 2): which capability-contract slots this package fills.
+# Group = qig.capabilities; name = contract slot_id; value = module:attr probe.
+# qig-stack's qig-doctor enumerates these (metadata-only) to verify the crystal
+# assembled correctly before any compute spend.
+# NOTE: PROPOSED slot pending qig-stack contract ratification — not yet in
+# qig_stack/contract.json, so qig-doctor classifies it as DRIFT (WARN, non-fatal)
+# until the contract adds the matching slot. Additive; genuine canonical primitive
+# (FisherCoordizer: text → Δ⁶³ basin-coordinate tokenize+embed engine).
+[project.entry-points."qig.capabilities"]
+"SLOT-COORDIZER" = "qig_coordizer.coordizer:FisherCoordizer"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/qig_coordizer"]
 
