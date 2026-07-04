@@ -27,6 +27,8 @@ except ModuleNotFoundError:  # allow standalone `python tests/test_incremental_e
     pytest = None
 
 from qig_coordizer import FisherCoordizer
+from qig_coordizer.normalizer import Normalizer
+from qig_coordizer.trainer import CoordinzerTrainer
 
 
 def _corpus(target_bytes: int = 8000) -> bytes:
@@ -173,6 +175,96 @@ if pytest is not None:
             (9, 9): {"count": 10, "coupling": 50.0, "entropy": 0.0, "contexts": []},  # score 5000
         }
         assert c._select_best_pair(ps) == (9, 9)
+
+    # ----------------------------------------------------------------------------------
+    # LOAD-BEARING gate: the frequency multiplier == physical duplication.
+    # The whole segment-frequency optimization rests on the claim that giving a unique
+    # pre-token segment an integer weight of ``freq`` is IDENTICAL to materializing
+    # ``freq`` physical copies of it. Basins are intrinsic (a merged token's basin is the
+    # geodesic midpoint of its parts; d_FR is cached-constant-per-pair), and weighted pair
+    # counts / corpus_len equal the physical-copy counts / length, so the greedy merge
+    # sequence must be bit-for-bit identical. If this ever diverges the collapse is unsound
+    # and the bug is REAL — diagnose it, never weaken this test.
+    # ----------------------------------------------------------------------------------
+
+    def test_freq_collapse_equals_physical() -> None:
+        def _seg_bounds(segs: list[list[int]]) -> tuple[list[int], list[int]]:
+            flat: list[int] = []
+            bounds: list[int] = []
+            for seg in segs:
+                bounds.append(len(flat))
+                flat.extend(seg)
+            return flat, bounds
+
+        def _seg_train(segs: list[list[int]], freqs: list[int], target_vocab: int,
+                       min_freq: int = 2) -> CoordinzerTrainer:
+            flat, bounds = _seg_bounds(segs)
+            t = CoordinzerTrainer(target_vocab_size=target_vocab)
+            t.train(
+                corpus=b"",
+                corpus_segments=(flat, bounds, list(freqs)),
+                min_frequency=min_freq,
+                verbose=False,
+                enable_interrupt=False,
+                use_kernel=False,
+            )
+            return t
+
+        # ~8 unique byte-segments with integer freqs — code-like segments upsampled ×30.
+        unique = [
+            list(b"def "), list(b"return "), list(b"self."), list(b"import "),
+            list(b"class "), list(b"for "), list(b"while "), list(b"print("),
+        ]
+        freqs = [30, 24, 30, 12, 9, 15, 7, 20]
+        target_vocab = 320
+
+        # PHYSICAL: each unique segment repeated ``freq`` times as separate segments, all weight 1.
+        phys_segs: list[list[int]] = []
+        for seg, f in zip(unique, freqs):
+            phys_segs.extend([list(seg) for _ in range(f)])
+        physical = _seg_train(phys_segs, [1] * len(phys_segs), target_vocab)
+
+        # COLLAPSED: each unique segment ONCE, weight = freq (the never-materialize path).
+        collapsed = _seg_train(unique, freqs, target_vocab)
+
+        assert len(collapsed.merge_rules) > 0, "no merges — corpus too small / min_freq too high"
+        assert physical.merge_rules == collapsed.merge_rules, (
+            "freq multiplier diverged from physical duplication — the segment-frequency "
+            "collapse optimization is UNSOUND; first diff at "
+            f"{next((i for i, (x, y) in enumerate(zip(physical.merge_rules, collapsed.merge_rules)) if x != y), 'len')}"
+        )
+        # The fused basin for each merged id must also match (intrinsic-basin claim).
+        assert set(physical.vocab) == set(collapsed.vocab)
+        for cid in physical.vocab:
+            assert np.array_equal(physical.vocab[cid].vector, collapsed.vocab[cid].vector), (
+                f"fused basin mismatch at coord {cid} — basins are not intrinsic"
+            )
+
+    def test_pretokenize_encode_roundtrip() -> None:
+        """A FisherCoordizer(pretokenize=True) must encode by applying merges PER pre-token
+        segment (then concatenating), and decode(encode(text)) must round-trip to NFC(text)
+        for simple ASCII."""
+        import unicodedata
+
+        corpus = _corpus(4000)
+        c = FisherCoordizer(target_vocab_size=320, pretokenize=True)
+        c.train(corpus, context_window=5, min_pair_count=2, verbose=False)
+
+        text = "the geometry is the truth on the simplex"
+        got = c.encode(text)
+
+        # Manual reference: apply the SAME merge_rules within each to_byte_segments segment.
+        norm = Normalizer(pretokenize=True)
+        manual: list[int] = []
+        for seg in norm.to_byte_segments(text):
+            coords = list(seg)
+            for a, b, new in c.merge_rules:
+                coords = c._apply_fusion(coords, a, b, new)
+            manual.extend(coords)
+        assert got == manual, "pretokenize encode != per-segment merge application"
+
+        # Round-trip: decode expands merges back to bytes → NFC(text) (identity for ASCII).
+        assert c.decode(got) == unicodedata.normalize("NFC", text)
 
 
 if __name__ == "__main__":

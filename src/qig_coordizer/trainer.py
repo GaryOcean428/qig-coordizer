@@ -188,6 +188,7 @@ class CoordinzerTrainer:
         target_vocab_size: int = 32000,
         basin_dim: int = BASIN_DIM,
         device: str = "cpu",
+        pretokenize: bool = False,
     ):
         self.target_vocab_size = target_vocab_size
         self.basin_dim = basin_dim
@@ -208,7 +209,8 @@ class CoordinzerTrainer:
 
         # NFC byte-level front-end — train corpus and coordize() must share it so the vocab and
         # the encoder agree byte-for-byte (NFC is a no-op for ASCII). Matches FisherCoordizer/Coordizer.
-        self._normalizer = Normalizer()
+        # pretokenize=True confines merges to per-token segments (both here and at coordize()).
+        self._normalizer = Normalizer(pretokenize=pretokenize)
 
         self._init_byte_coordinates()
 
@@ -288,6 +290,7 @@ class CoordinzerTrainer:
         _resume_corpus: list[int] | None = None,
         enable_interrupt: bool = True,
         use_kernel: bool = False,
+        corpus_segments: tuple[list[int], list[int], list[int]] | None = None,
     ) -> "CoordinzerTrainer":
         """Train coordizer with kernel-in-loop Φ/κ feedback.
 
@@ -295,19 +298,41 @@ class CoordinzerTrainer:
             enable_interrupt: If True, listen for ENTER key to pause training.
             use_kernel: If True, use real kernel for Φ measurement (slower but accurate).
                        If False, use fast frequency×coupling scoring.
+            corpus_segments: Optional ``(flat_tokens, seg_bounds, weights)`` for the
+                segment-frequency (pretokenized, frequency-weighted) BPE path. ``flat_tokens``
+                are already-byte-id coordinates (NFC/byte encoding done by the caller — NOT
+                re-normalized here); ``seg_bounds`` is the START slot of each pre-token segment
+                (merges never cross a boundary); ``weights`` is one integer FREQUENCY per
+                segment (the ×N upsample becomes an integer multiplier, not physical copies).
+                ``None`` reduces EXACTLY to the flat whole-corpus BPE over ``corpus``. Ignored
+                on resume. Basins are intrinsic (a merged token's basin is the geodesic midpoint
+                of its parts, d_FR cached-constant-per-pair), so freq-collapse is provably
+                identical to physical duplication — the ``test_freq_collapse_equals_physical`` gate.
         """
         start_time = time.time()
         is_resume = _resume_corpus is not None
         interrupted = False
 
-        # Compute corpus hash for provenance (SHA-256 of first/last 1MB — fast, no full hash)
+        # Compute corpus hash for provenance (SHA-256 of first/last 1MB — fast, no full hash).
+        # In segment-frequency mode ``corpus`` is empty (the corpus lives in ``corpus_segments``),
+        # so hash a compact repr of the segments instead of the empty byte string.
         import hashlib as _hl
-        if len(corpus) <= 2_000_000:
-            self._corpus_hash = _hl.sha256(corpus).hexdigest()[:16]
+        if corpus:
+            if len(corpus) <= 2_000_000:
+                self._corpus_hash = _hl.sha256(corpus).hexdigest()[:16]
+            else:
+                head = corpus[:1_000_000]
+                tail = corpus[-1_000_000:]
+                self._corpus_hash = _hl.sha256(head + tail).hexdigest()[:16]
+        elif corpus_segments is not None and not is_resume:
+            _flat, _bounds, _weights = corpus_segments
+            _repr = repr(
+                (_flat[:100_000], _bounds[:100_000], _weights[:100_000],
+                 len(_flat), len(_bounds))
+            ).encode("utf-8")
+            self._corpus_hash = _hl.sha256(_repr).hexdigest()[:16]
         else:
-            head = corpus[:1_000_000]
-            tail = corpus[-1_000_000:]
-            self._corpus_hash = _hl.sha256(head + tail).hexdigest()[:16]
+            self._corpus_hash = _hl.sha256(corpus).hexdigest()[:16]
 
         # Start interrupt listener. Route Ctrl+C (SIGINT) into the SAME graceful
         # flag the ENTER listener sets, so an interrupt pauses + saves a checkpoint
@@ -339,10 +364,14 @@ class CoordinzerTrainer:
 
         # Use pre-processed corpus if resuming, otherwise start fresh
         # NFC-normalize the corpus (same front-end as coordize) so the vocab matches inference.
-        # Resume passes already-processed coords, so only normalize a fresh byte corpus.
-        corpus_coords = (
-            _resume_corpus if is_resume else list(self._normalizer.normalize_bytes(corpus))
-        )
+        # Resume passes already-processed coords; segment-frequency mode passes already-byte-id
+        # flat tokens (do NOT re-normalize — they are ids, not raw bytes); else normalize fresh bytes.
+        if is_resume:
+            corpus_coords = _resume_corpus
+        elif corpus_segments is not None:
+            corpus_coords = list(corpus_segments[0])
+        else:
+            corpus_coords = list(self._normalizer.normalize_bytes(corpus))
         current_vocab_size = len(self.vocab)
 
         # Baseline Φ/κ
@@ -359,7 +388,17 @@ class CoordinzerTrainer:
         # were never applied, so the live trainer was selecting merges off inflated counts.
         if verbose:
             print("Building initial pair statistics...")
-        pair_tracker = IncrementalCouplingCache(corpus_coords, context_window)
+        if corpus_segments is not None and not is_resume:
+            # Segment-frequency mode: per-segment DLLs (merges never cross a boundary) with an
+            # integer frequency per segment. pair_counts / corpus_len are weighted; the trainer's
+            # LazyPairHeap + _pair_score read those transparently, so selection is UNCHANGED.
+            pair_tracker = IncrementalCouplingCache(
+                corpus_coords, context_window,
+                seg_bounds=corpus_segments[1], weights=corpus_segments[2],
+            )
+        else:
+            pair_tracker = IncrementalCouplingCache(corpus_coords, context_window)
+        initial_corpus_len = pair_tracker.corpus_len   # weighted; denominator for the compression stat
         if verbose:
             print(f"  Found {len(pair_tracker.pair_counts):,} unique pairs")
             print()
@@ -569,12 +608,17 @@ class CoordinzerTrainer:
             print(f"Merge rules: {len(self.merge_rules):,}")
             print(f"Time: {elapsed/60:.1f} minutes")
 
-            final_corpus = pair_tracker.corpus_coords
-            sample_coords = [self.vocab[c].vector for c in final_corpus[:100]]
+            # sample(100) avoids reconstructing the whole compact substrate just for the Φ probe.
+            sample_coords = [self.vocab[c].vector for c in pair_tracker.sample(100)]
             final_phi, final_kappa = self.kernel.measure_phi_kappa(sample_coords)
             print(f"Final Φ={final_phi:.3f} (Δ={final_phi-baseline_phi:+.3f})")
             print(f"Final κ={final_kappa:.1f}")
-            print(f"Compression: {len(corpus):,} → {len(final_corpus):,} ({100*len(final_corpus)/len(corpus):.1f}%)")
+            # Weighted lengths so the ratio is meaningful in BOTH flat and segment-frequency mode
+            # (avoids the ZeroDivisionError when corpus=b"" in segment mode).
+            final_len = pair_tracker.corpus_len
+            if initial_corpus_len:
+                print(f"Compression: {initial_corpus_len:,} → {final_len:,} "
+                      f"({100 * final_len / initial_corpus_len:.1f}%)")
 
         return self
 
@@ -861,12 +905,20 @@ class CoordinzerTrainer:
                 pass  # Ignore deletion errors
 
     def coordize(self, text: str) -> list[int]:
-        """Convert text to coordinate sequence."""
-        # NFC front-end (same as train corpus) so encoding matches the trained vocab.
-        coords = list(self._normalizer.to_bytes(text))
-        for coord_a, coord_b, new_coord in self.merge_rules:
-            coords = self._apply_fusion(coords, coord_a, coord_b, new_coord)
-        return coords
+        """Convert text to coordinate sequence.
+
+        Merges are applied PER pre-token SEGMENT then concatenated, so a vocab trained with
+        ``pretokenize=True`` encodes exactly the way it was built (no merge crosses a segment
+        boundary). With ``pretokenize=False`` :meth:`Normalizer.to_byte_segments` returns a
+        single segment (the whole byte stream), reducing to the original whole-stream path.
+        """
+        out: list[int] = []
+        for seg in self._normalizer.to_byte_segments(text):
+            coords = list(seg)
+            for coord_a, coord_b, new_coord in self.merge_rules:
+                coords = self._apply_fusion(coords, coord_a, coord_b, new_coord)
+            out.extend(coords)
+        return out
 
     def decoordize(self, coord_ids: list[int]) -> str:
         """Convert coordinates back to text."""
