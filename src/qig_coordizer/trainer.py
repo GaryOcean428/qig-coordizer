@@ -954,6 +954,9 @@ class CoordinzerTrainer:
             "target_vocab_size": self.target_vocab_size,
             "basin_dim": self.basin_dim,
             "vocab_size": len(self.vocab),
+            # persist the pretokenize mode so FisherCoordizer.load restores the SAME segmentation the
+            # vocab was trained with (else the trainer->load->save build chain silently drops it to False).
+            "pretokenize": self._normalizer.pretokenize,
             "merge_rules": self.merge_rules,
             "vocab": {
                 str(k): {
