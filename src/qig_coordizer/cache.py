@@ -165,59 +165,113 @@ class IncrementalCouplingCache:
     WHICH pair to merge; this cache keeps the counts exact in O(occurrences) per merge.
     """
 
-    def __init__(self, corpus_coords: list[int], context_window: int = 3) -> None:
+    def __init__(
+        self,
+        corpus_coords: list[int],
+        context_window: int = 3,
+        *,
+        seg_bounds: list[int] | None = None,
+        weights: list[int] | None = None,
+    ) -> None:
+        """Build the incremental tracker.
+
+        ``seg_bounds`` (Tier-1 segment-frequency mode): the START slot of each pre-token
+        segment (``seg_bounds[0] == 0``; the last segment runs to the end). Merges never
+        cross a boundary — the linked list is cut (``nxt = -1``) at each segment's last slot,
+        so ONE buffer holds many independent per-segment DLLs. ``None`` ⇒ one segment (the
+        flat byte stream), reproducing the original whole-corpus BPE bit-for-bit.
+
+        ``weights``: one integer FREQUENCY per segment (len == n_segments). A pair's count is
+        the weighted sum of its occurrences' segment frequencies, so the ×30 code upsample is
+        an integer multiplier, NOT 30 physical copies — the never-materialize win. ``None`` ⇒
+        all-ones, making ``pair_counts`` the plain occurrence count (the flat reduction).
+        """
         n = len(corpus_coords)
         self.context_window = context_window
         # Doubly-linked list over the corpus slots (same structure as the proven trainer).
-        self.sym: list[int] = list(corpus_coords)           # symbol at each slot
-        self.nxt: list[int] = list(range(1, n)) + [-1]      # successor (-1 = end)
-        self.prv: list[int] = [-1] + list(range(0, n - 1))  # predecessor
-        self.alive = bytearray([1]) * n                     # slot still present?
+        self.sym: list[int] = list(corpus_coords)               # symbol at each slot
+        self.nxt: list[int] = (list(range(1, n)) + [-1]) if n else []   # successor (-1 = end)
+        self.prv: list[int] = ([-1] + list(range(0, n - 1))) if n else []  # predecessor
+        self.alive = bytearray([1]) * n                         # slot still present?
 
-        # pair -> set of left-slot positions; counts derive from the set sizes.
+        # -- segments + per-slot frequency weight ------------------------------------------
+        seg_starts = ([0] if n else []) if seg_bounds is None else list(seg_bounds)
+        if weights is None:
+            seg_w = [1] * len(seg_starts)
+        else:
+            seg_w = [int(w) for w in weights]
+            if len(seg_w) != len(seg_starts):
+                raise ValueError(
+                    f"weights ({len(seg_w)}) must have one entry per segment ({len(seg_starts)})"
+                )
+        self.slot_wt: list[int] = [1] * n           # frequency of the segment each slot belongs to
+        self._seg_heads: list[int] = list(seg_starts)
+        seg_ends = seg_starts[1:] + ([n] if seg_starts else [])
+        for k, (s, e) in enumerate(zip(seg_starts, seg_ends)):
+            w = seg_w[k]
+            for i in range(s, e):
+                self.slot_wt[i] = w
+            if 0 <= e - 1 < n:
+                self.nxt[e - 1] = -1            # cut: no merge crosses OUT of this segment
+            if 0 <= s < n:
+                self.prv[s] = -1               # cut: no merge crosses INTO this segment
+
+        # pair -> set of left-slot positions; count = weighted SUM of occurrences (never crosses
+        # a boundary, because nxt is already -1 at each segment end).
         self.pair_pos: dict[tuple[int, int], set[int]] = defaultdict(set)
-        for i in range(n - 1):
-            self.pair_pos[(self.sym[i], self.sym[i + 1])].add(i)
-        self.pair_counts: dict[tuple[int, int], int] = {
-            p: len(s) for p, s in self.pair_pos.items()
-        }
+        for i in range(n):
+            j = self.nxt[i]
+            if j != -1:
+                self.pair_pos[(self.sym[i], self.sym[j])].add(i)
+        self.pair_counts: dict[tuple[int, int], int] = {}
+        for p, positions in self.pair_pos.items():
+            self.pair_counts[p] = sum(self.slot_wt[i] for i in positions)
 
         # Δ-set for the lazy max-heap selection in the trainer: every pair whose count was
-        # mutated by the LAST ``apply_merge`` maps to its NEW count (0 ⇒ removed/dead). Only
-        # these pairs need a fresh heap entry next merge, turning per-merge selection from
+        # mutated by the LAST ``apply_merge`` maps to its NEW (weighted) count (0 ⇒ removed/dead).
+        # Only these need a fresh heap entry next merge, turning per-merge selection from
         # O(P log P) (full argsort over all P active pairs) into amortised O(Δ·log P). The
-        # incremental score depends only on ``count`` (Fisher-Rao distance is constant per
-        # pair — basins never move), so a count-change is the ONLY trigger for a re-push.
+        # incremental score depends only on ``count`` (Fisher-Rao distance is constant per pair —
+        # basins never move), so a count-change is the ONLY trigger for a re-push.
         self.last_changed: dict[tuple[int, int], int] = {}
 
+        # Two lengths: weighted (what ``corpus_len`` reports — the BPE-relevant total) and the raw
+        # live-slot count (for O(slots) reconstruction of the compact substrate).
+        self._wlen = sum(self.slot_wt)          # every slot alive at init
         self._n_alive = n
-        # Slot 0 can never be the right half of a merge (j = nxt[i] ≥ 1), so it never dies;
-        # walking ``nxt`` from slot 0 visits exactly the alive slots in order.
-        self._head = 0 if n else -1
+        # Head of segment 0. Its first slot never dies (j = nxt[i] ≥ start+1), so walking ``nxt``
+        # from each segment head visits exactly that segment's alive slots in order.
+        self._head = seg_starts[0] if seg_starts else -1
 
     # -- read interface --------------------------------------------------------------
     @property
     def corpus_len(self) -> int:
-        return self._n_alive
+        """Frequency-weighted live length = Σ segment_freq · segment_len (the BPE-relevant total;
+        equals the raw live-slot count in the flat, all-ones-weight reduction)."""
+        return self._wlen
 
     @property
     def corpus_coords(self) -> list[int]:
-        """Reconstruct the full live coordinate sequence (O(corpus); needed once at save)."""
+        """Reconstruct the live coordinate sequence, segments concatenated (O(live slots))."""
         return self.sample(self._n_alive)
 
     def sample(self, n: int) -> list[int]:
-        """First ``n`` live coordinates (O(n)); cheap path for per-merge kernel sampling."""
+        """First ``n`` live coordinates across all segments in order (O(n)); cheap path for
+        per-merge kernel sampling. Values are cast to python ``int`` so pair keys and equality
+        never depend on the underlying store type."""
         out: list[int] = []
-        i = self._head
-        # Defensive: slot 0 never dies by construction (j = nxt[i] ≥ 1, so slot 0 is never the
-        # right half of a merge), but advance past any dead leading slot so reconstruction stays
-        # correct even if that invariant is ever changed by future edits.
-        while i != -1 and not self.alive[i]:
-            i = self.nxt[i]
-        while i != -1 and len(out) < n:
-            if self.alive[i]:
-                out.append(self.sym[i])
-            i = self.nxt[i]
+        for head in self._seg_heads:
+            i = head
+            # Defensive: a segment head never dies by construction, but advance past any dead
+            # leading slot so reconstruction stays correct even if that invariant changes.
+            while i != -1 and not self.alive[i]:
+                i = self.nxt[i]
+            while i != -1 and len(out) < n:
+                if self.alive[i]:
+                    out.append(int(self.sym[i]))
+                i = self.nxt[i]
+            if len(out) >= n:
+                break
         return out
 
     def get_pairs(self, min_count: int = 5) -> dict[tuple[int, int], int]:
@@ -229,18 +283,21 @@ class IncrementalCouplingCache:
         if s and i in s:
             s.discard(i)
             if s:
-                self.pair_counts[p] = len(s)
-                self.last_changed[p] = len(s)
+                c = self.pair_counts[p] - self.slot_wt[i]   # weighted decrement (exact, integer)
+                self.pair_counts[p] = c
+                self.last_changed[p] = c
             else:
                 self.pair_pos.pop(p, None)
                 self.pair_counts.pop(p, None)
                 self.last_changed[p] = 0  # dropped to 0 ⇒ invalidate its heap entry
 
     def _add(self, p: tuple[int, int], i: int) -> None:
-        self.pair_pos[p].add(i)
-        c = len(self.pair_pos[p])
-        self.pair_counts[p] = c
-        self.last_changed[p] = c
+        s = self.pair_pos[p]
+        if i not in s:                      # guard: never double-count a position (weighted sums)
+            s.add(i)
+            c = self.pair_counts.get(p, 0) + self.slot_wt[i]   # weighted increment
+            self.pair_counts[p] = c
+            self.last_changed[p] = c
 
     def apply_merge(self, coord_a: int, coord_b: int, new_coord: int) -> int:
         """Fuse every adjacent occurrence of (coord_a, coord_b) into new_coord.
@@ -278,6 +335,7 @@ class IncrementalCouplingCache:
                 prv[k] = i
             alive[j] = 0
             self._n_alive -= 1
+            self._wlen -= self.slot_wt[j]      # weighted length drops by this segment's frequency
             merged += 1
             # add the two new pairs
             if h != -1 and alive[h]:

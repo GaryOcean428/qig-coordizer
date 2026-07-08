@@ -61,6 +61,8 @@ class FisherCoordizer:
         self,
         basin_dim: int = BASIN_DIM,
         target_vocab_size: int = 32_000,
+        pretokenize: bool = False,
+        max_segment_bytes: int | None = None,
     ):
         self.basin_dim = basin_dim
         self.target_vocab_size = target_vocab_size
@@ -92,7 +94,10 @@ class FisherCoordizer:
         # NFC byte-level front-end (qig-coordizer Phase 1 §3.2): canonicalizes text before
         # byte encoding so the same character always maps to the same byte sequence. NFC is a
         # no-op for ASCII, so existing artifacts and the naive==incremental gate are unaffected.
-        self._normalizer = Normalizer()
+        # pretokenize=True makes coordize/encode apply merges per pre-token segment (matches a
+        # vocab trained with the segment-frequency path); False = single whole-stream segment.
+        # max_segment_bytes caps degenerate run-on segments char-safely (encoder must chunk as trained).
+        self._normalizer = Normalizer(pretokenize=pretokenize, max_segment_bytes=max_segment_bytes)
 
         # Initialize base byte coordinates
         self._init_byte_coordinates()
@@ -765,11 +770,20 @@ class FisherCoordizer:
             self._encoding_cache[(coord_a, coord_b)] = new_coord
 
     def _coordize_plain(self, text: str) -> list[int]:
-        """Byte-encode + apply all fusion merges (the original coordize path, no special-token handling)."""
-        coord_ids = list(self._normalizer.to_bytes(text))
-        for coord_a, coord_b, new_coord in self.merge_rules:
-            coord_ids = self._apply_fusion(coord_ids, coord_a, coord_b, new_coord)
-        return coord_ids
+        """Byte-encode + apply all fusion merges (no special-token handling).
+
+        Segment-aware: merges are applied WITHIN each pre-token segment then concatenated, so a
+        vocab trained with ``pretokenize=True`` encodes consistently (no merge crosses a segment
+        boundary). With ``pretokenize=False`` :meth:`Normalizer.to_byte_segments` yields one
+        whole-stream segment, reducing bit-for-bit to the original path.
+        """
+        out: list[int] = []
+        for seg in self._normalizer.to_byte_segments(text):
+            coord_ids = list(seg)
+            for coord_a, coord_b, new_coord in self.merge_rules:
+                coord_ids = self._apply_fusion(coord_ids, coord_a, coord_b, new_coord)
+            out.extend(coord_ids)
+        return out
 
     def coordize(self, text: str) -> CoordizationResult:
         """
@@ -916,6 +930,8 @@ class FisherCoordizer:
         data = {
             "basin_dim": self.basin_dim,
             "target_vocab_size": self.target_vocab_size,
+            "pretokenize": self._normalizer.pretokenize,   # segment-confined encode (per-token merges)
+            "max_segment_bytes": self._normalizer.max_segment_bytes,  # char-safe run-on cap (None = off)
             "merge_rules": self.merge_rules,
             "special_tokens": self.special_tokens,   # atomic control-token ids (above the trained vocab)
             "vocab": {
@@ -962,8 +978,15 @@ class FisherCoordizer:
         # Handle both formats: target_vocab_size or vocab_size
         target_vocab_size = data.get("target_vocab_size", data.get("vocab_size", 32000))
 
-        # Create instance with inferred parameters
-        instance = cls(basin_dim=basin_dim, target_vocab_size=target_vocab_size)
+        # Create instance with inferred parameters. Old artifacts without the key default to
+        # pretokenize=False (whole-stream merges — the historical behaviour) and max_segment_bytes=None
+        # (no cap — so old artifacts encode byte-identically to how they were built).
+        instance = cls(
+            basin_dim=basin_dim,
+            target_vocab_size=target_vocab_size,
+            pretokenize=data.get("pretokenize", False),
+            max_segment_bytes=data.get("max_segment_bytes", None),
+        )
 
         instance.merge_rules = [tuple(r) for r in data["merge_rules"]]
 

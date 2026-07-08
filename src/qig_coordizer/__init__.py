@@ -19,6 +19,7 @@ from qig_coordizer.constants import BASIN_DIM
 from qig_coordizer.coordizer import FisherCoordizer
 from qig_coordizer.normalizer import Normalizer
 from qig_coordizer.special_tokens import SpecialTokens
+from qig_coordizer.trainer import CoordinzerTrainer
 from qig_coordizer.types import (
     BasinCoordinate,
     CoordizationResult,
@@ -27,10 +28,11 @@ from qig_coordizer.types import (
     VocabStats,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 __all__ = [
     "FisherCoordizer",
+    "CoordinzerTrainer",
     "Normalizer",
     "IncrementalCouplingCache",
     "BasinCoordinate",
