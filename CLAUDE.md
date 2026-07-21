@@ -38,7 +38,10 @@ from the oracle (the merge-121 bug). Run the oracle; never trust a docstring.
 ## Branch convention
 
 Work on `development`; `master`/`main` is the promotion target. Subagents RETURN
-DATA — never git-commit autonomously.
+DATA — never git-commit autonomously **by default**. EXCEPTION (PI ruling 2026-07-21):
+an EXPLICIT lane directive that names this repo and instructs a commit supersedes this
+repo-local default — surface the tension (don't silently override), then proceed per the
+explicit directive. Precedent: the W7 release-workflow fix (matrix aaed5896) committed here.
 
 ## Publishing
 
