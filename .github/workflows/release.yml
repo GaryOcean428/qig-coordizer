@@ -10,8 +10,10 @@ name: release
 # Until that is registered, the publish job will fail auth. Tag a release v0.1.0 to fire.
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']          # W7 fix: publish on TAG PUSH. A GitHub Release also pushes its tag,
+                          # so this covers both. Firing on `release: published` alone meant a
+                          # tag-only push (v0.9.5) SILENTLY never published — condition unmet, unnoticed.
   workflow_dispatch:
 
 permissions:
@@ -30,9 +32,9 @@ jobs:
       - run: python -m pytest -q
       - run: python -m build
       - name: version matches release tag
-        if: github.event_name == 'release'
+        if: startsWith(github.ref, 'refs/tags/')
         env:
-          TAG_NAME: ${{ github.event.release.tag_name }}
+          TAG_NAME: ${{ github.ref_name }}
         run: |
           TAG="${TAG_NAME#v}"
           BUILT=$(ls dist/*.whl | sed -E 's#.*/qig_coordizer-([0-9][^-]*)-.*#\1#' | head -1)
@@ -44,7 +46,7 @@ jobs:
 
   publish:
     needs: build-test
-    if: github.event_name == 'release'
+    if: startsWith(github.ref, 'refs/tags/')   # only a tag push uploads (a Release pushes its tag too)
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
@@ -55,3 +57,18 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b  # release/v1
+        with:
+          skip-existing: true          # idempotent — a re-run / double-trigger must not hard-fail
+      - name: Verify the version is LIVE on PyPI (W7 — no silent non-publish)
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          VER="${REF_NAME#v}"
+          for i in $(seq 1 12); do
+            if python3 -c "import urllib.request,sys; urllib.request.urlopen('https://pypi.org/pypi/qig-coordizer/'+sys.argv[1]+'/json')" "$VER" 2>/dev/null; then
+              echo "qig-coordizer $VER is LIVE on PyPI ✓"; exit 0
+            fi
+            echo "waiting for PyPI to index $VER ($i/12)…"; sleep 10
+          done
+          echo "::error::qig-coordizer $VER NOT on PyPI ~2 min after publish — the release did not land"
+          exit 1
