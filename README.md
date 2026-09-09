@@ -45,3 +45,9 @@ Extracted from `qig-tokenizer` commit `1394ca7` (Phase-1 coordizer) per
 uv venv && uv pip install -e ../qig-core && uv pip install -e '.[dev]'
 pytest
 ```
+
+## Release version
+
+`qig_coordizer.__version__` reads the installed distribution metadata, matching
+`importlib.metadata.version("qig-coordizer")`. An uninstalled source checkout
+reports `0+unknown` instead of claiming a published release.
