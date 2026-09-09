@@ -14,6 +14,9 @@ Phase-0 gate).
 
 from __future__ import annotations
 
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _distribution_version
+
 from qig_coordizer.cache import IncrementalCouplingCache
 from qig_coordizer.constants import BASIN_DIM
 from qig_coordizer.coordizer import FisherCoordizer
@@ -28,19 +31,26 @@ from qig_coordizer.types import (
     VocabStats,
 )
 
-__version__ = "0.1.2"
+# Distribution metadata is the release-version source of truth. A source tree
+# without installed metadata must not advertise an unrelated published version.
+
+try:
+    __version__ = _distribution_version("qig-coordizer")
+except PackageNotFoundError:
+    __version__ = "0+unknown"
+del PackageNotFoundError, _distribution_version
 
 __all__ = [
-    "FisherCoordizer",
-    "CoordinzerTrainer",
-    "Normalizer",
-    "IncrementalCouplingCache",
-    "BasinCoordinate",
-    "CoordizationResult",
-    "TokenCandidate",
-    "GranularityConfig",
-    "VocabStats",
-    "SpecialTokens",
     "BASIN_DIM",
+    "BasinCoordinate",
+    "CoordinzerTrainer",
+    "CoordizationResult",
+    "FisherCoordizer",
+    "GranularityConfig",
+    "IncrementalCouplingCache",
+    "Normalizer",
+    "SpecialTokens",
+    "TokenCandidate",
+    "VocabStats",
     "__version__",
 ]

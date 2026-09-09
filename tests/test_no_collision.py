@@ -36,3 +36,38 @@ def test_fishercoordizer_resolves_to_standalone_module():
     assert FisherCoordizer.__module__ == "qig_coordizer.coordizer"
     # Stronger than __module__: the file must live in the standalone repo, not a copy.
     assert "qig_coordizer/coordizer.py" in inspect.getfile(FisherCoordizer)
+
+
+def test_public_version_matches_distribution_metadata():
+    """The version reported to callers must identify the installed release."""
+    from importlib.metadata import version
+
+    assert qig_coordizer.__version__ == version("qig-coordizer")
+
+
+def test_public_version_uses_metadata_without_a_second_literal(monkeypatch):
+    import importlib.metadata
+    import runpy
+
+    requested = []
+
+    def installed_version(name):
+        requested.append(name)
+        return "9.8.7"
+
+    monkeypatch.setattr(importlib.metadata, "version", installed_version)
+    namespace = runpy.run_path(qig_coordizer.__file__)
+    assert namespace["__version__"] == "9.8.7"
+    assert requested == ["qig-coordizer"]
+
+
+def test_source_without_distribution_metadata_reports_unknown(monkeypatch):
+    import importlib.metadata
+    import runpy
+
+    def missing_version(name):
+        raise importlib.metadata.PackageNotFoundError(name)
+
+    monkeypatch.setattr(importlib.metadata, "version", missing_version)
+    namespace = runpy.run_path(qig_coordizer.__file__)
+    assert namespace["__version__"] == "0+unknown"
